@@ -1,0 +1,36 @@
+# Fork overlay：GitHub 把代码推到 CNB，再 api_trigger。CNB 按这份代码在 amd64 节点构建。
+# 生产只拉 CNB。不要把 GHCR 镜像拷过来。三个前端各用自己的版本号，不打 latest。
+
+$:
+  api_trigger:
+    - name: 构建并发布镜像
+      runner:
+        tags: cnb:arch:amd64
+      services:
+        - docker
+      stages:
+        - name: 构建并推送
+          script: |
+            set -eu
+            uname -m | grep -qx x86_64
+            REG="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
+            for platform in manager merchant cashier; do
+              svc="jeepay-ui-${platform}"
+              raw="$(awk -F'"' '/"version"/ { print $4; exit }' "${svc}/package.json" | tr -d '[:space:]')"
+              echo "$raw" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+              VER="v${raw}"
+              docker build \
+                --platform linux/amd64 \
+                --build-arg "PLATFORM=${platform}" \
+                --label "org.opencontainers.image.source=https://github.com/Marco9442/jeepay-ui" \
+                --label "org.opencontainers.image.revision=${CNB_COMMIT}" \
+                --label "org.opencontainers.image.version=${VER}" \
+                --label "org.opencontainers.image.title=${svc}" \
+                --label "org.opencontainers.image.licenses=LGPL-3.0" \
+                -t "${REG}/${svc}:${VER}" \
+                .
+              arch="$(docker image inspect --format '{{.Architecture}}' "${REG}/${svc}:${VER}")"
+              echo "${svc} ${VER} architecture ${arch}"
+              [ "$arch" = "amd64" ]
+              docker push "${REG}/${svc}:${VER}"
+            done

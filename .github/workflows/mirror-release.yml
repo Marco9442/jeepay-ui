@@ -1,0 +1,487 @@
+# 本文件属于 Fork overlay：上游同步后必须保留。
+# 每小时看 jeequan/jeepay-ui 的 main 有没有新提交。有的话合进来，并保留 overlay。
+# GitHub 构建三个前端并推到 GHCR。代码再推到 CNB，由 CNB 自己构建。不把 GHCR 镜像拷到 CNB。
+# 定时同步如果产生了新提交，由紧接着的 push 触发发布，避免同一次更新构建两次。
+name: 同步上游并发布镜像
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: jeepay-ui-mirror
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  UPSTREAM_REPO: jeequan/jeepay-ui
+  OVERLAY_FILES: ".github/workflows/mirror-release.yml .cnb.yml scripts/needs-upstream-sync.sh"
+  PLATFORMS: "manager merchant cashier"
+  # 生产目前仍按这个旧提交在机器上编译。自检用它确认“落后的提交”会被看成有更新。
+  OLD_PIN: "17d057db22ae45babc15bd7cb43e5f73756dd080"
+
+jobs:
+  check-updates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: 确认能识别上游更新
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream main
+
+          echo "上游 $(git rev-parse --short upstream/main)"
+          echo "本仓库 $(git rev-parse --short HEAD)"
+          current="$(sh scripts/needs-upstream-sync.sh HEAD)"
+          if [ "$current" = yes ]; then
+            echo "本仓库相对上游：有更新"
+          else
+            echo "本仓库相对上游：无更新"
+          fi
+
+          if [ "$(sh scripts/needs-upstream-sync.sh upstream/main)" != no ]; then
+            echo "自检失败：上游最新被识别成还有更新" >&2
+            exit 1
+          fi
+          parent="$(git rev-parse upstream/main^)"
+          if [ "$(sh scripts/needs-upstream-sync.sh "$parent")" != yes ]; then
+            echo "自检失败：上一个上游提交没有被识别为更新" >&2
+            exit 1
+          fi
+          echo "自检：上一个上游提交能被识别为更新"
+          if git cat-file -e "${OLD_PIN}^{commit}" 2>/dev/null; then
+            if [ "$(sh scripts/needs-upstream-sync.sh "$OLD_PIN")" != yes ]; then
+              echo "自检失败：旧提交没有被识别为更新" >&2
+              exit 1
+            fi
+            echo "自检：旧提交 ${OLD_PIN:0:12} 落后 $(git rev-list --count "${OLD_PIN}..upstream/main") 个提交，能被识别为更新"
+          else
+            echo "自检：旧提交不在历史中，跳过"
+          fi
+          echo "自检通过"
+
+  sync:
+    needs: check-updates
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: 同步上游 main
+        id: sync
+        env:
+          OVERLAY_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B main origin/main
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream main
+
+          if [ "$(sh scripts/needs-upstream-sync.sh HEAD)" = no ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "已包含上游最新提交，无需同步"
+            exit 0
+          fi
+
+          restore_overlay() {
+            # shellcheck disable=SC2086
+            git checkout "$OVERLAY_SHA" -- $OVERLAY_FILES
+            # shellcheck disable=SC2086
+            git add -- $OVERLAY_FILES
+          }
+
+          # GITHUB_TOKEN 不能创建或更新 workflow 文件。overlay 以外的
+          # .github/workflows 保持本仓库当前版本，不随上游带走。
+          drop_non_overlay_workflows() {
+            local f
+            {
+              git diff --name-only --cached -- .github/workflows
+              git ls-files -u -- .github/workflows | awk '{print $4}'
+            } | sort -u | while read -r f; do
+              [ -z "$f" ] && continue
+              case " ${OVERLAY_FILES} " in
+                *" ${f} "*) continue ;;
+              esac
+              if git cat-file -e "HEAD:${f}" 2>/dev/null; then
+                echo "不同步上游 workflow: 还原 ${f}"
+                git checkout HEAD -- "$f"
+              else
+                echo "不同步上游 workflow: 去掉 ${f}"
+                git rm -f --ignore-unmatch -- "$f"
+              fi
+            done
+          }
+
+          git merge --no-commit --no-ff upstream/main || true
+          if [ ! -f .git/MERGE_HEAD ]; then
+            echo "上游合并未开始" >&2
+            git status
+            exit 1
+          fi
+
+          restore_overlay
+          drop_non_overlay_workflows
+
+          leftover="$(git ls-files -u | awk '{print $4}' | sort -u | grep -v -E '^(\.github/workflows/mirror-release\.yml|\.cnb\.yml|scripts/needs-upstream-sync\.sh)$' || true)"
+          if [ -n "$leftover" ]; then
+            echo "存在无法自动解决的合并冲突:" >&2
+            echo "$leftover" >&2
+            git status
+            exit 1
+          fi
+
+          git commit --no-edit
+          git push origin HEAD:main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: [check-updates, sync]
+    if: |
+      always() &&
+      needs.check-updates.result == 'success' &&
+      (needs.sync.result == 'success' || needs.sync.result == 'skipped') &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && needs.sync.outputs.changed != 'true'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+      CNB_REPO: ${{ vars.CNB_REPO }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: 确认 CNB 凭证
+        run: |
+          set -euo pipefail
+          if [ -z "${CNB_TOKEN}" ]; then
+            echo "缺少 GitHub Secret: CNB_TOKEN" >&2
+            exit 1
+          fi
+          if [ -z "${CNB_REPO}" ]; then
+            echo "缺少 GitHub Variable: CNB_REPO" >&2
+            exit 1
+          fi
+
+      - name: 解析三个前端的版本
+        id: ver
+        run: |
+          set -euo pipefail
+          pairs=""
+          for platform in ${PLATFORMS}; do
+            svc="jeepay-ui-${platform}"
+            raw="$(awk -F'"' '/"version"/ { print $4; exit }' "${svc}/package.json" | tr -d '[:space:]')"
+            if ! echo "$raw" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "${svc} 的 version 必须是 x.y.z，当前是: ${raw}" >&2
+              exit 1
+            fi
+            echo "${svc} v${raw}"
+            pairs="${pairs} ${svc}:v${raw}"
+          done
+          echo "pairs=${pairs# }" >> "$GITHUB_OUTPUT"
+
+      - name: 检查 GHCR 是否已有同版本
+        id: published
+        env:
+          PAIRS: ${{ steps.ver.outputs.pairs }}
+        run: |
+          set -euo pipefail
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          python3 - "$owner" $PAIRS <<'PY'
+          import json, os, sys, urllib.request, urllib.error
+          owner, *items = sys.argv[1:]
+          missing = []
+          for item in items:
+              svc, version = item.split(":", 1)
+              tok_url = f"https://ghcr.io/token?service=ghcr.io&scope=repository:{owner}/{svc}:pull"
+              with urllib.request.urlopen(tok_url, timeout=20) as r:
+                  token = json.load(r).get("token") or ""
+              req = urllib.request.Request(f"https://ghcr.io/v2/{owner}/{svc}/manifests/{version}")
+              req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json")
+              try:
+                  urllib.request.urlopen(req, timeout=20)
+              except urllib.error.HTTPError:
+                  missing.append(item)
+          skip = "false" if missing else "true"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write("skip=" + skip + "\n")
+              f.write("missing=" + " ".join(missing) + "\n")
+          print("skip", skip, "missing", ",".join(missing) or "-")
+          PY
+
+      - name: 登录 GHCR
+        if: steps.published.outputs.skip != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送 GHCR 镜像
+        if: steps.published.outputs.skip != 'true'
+        env:
+          MISSING: ${{ steps.published.outputs.missing }}
+        run: |
+          set -euo pipefail
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          src="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          rev="$(git rev-parse HEAD)"
+          for item in ${MISSING}; do
+            svc="${item%%:*}"
+            version="${item##*:}"
+            platform="${svc#jeepay-ui-}"
+            img="ghcr.io/${owner}/${svc}"
+            docker build \
+              --platform linux/amd64 \
+              --build-arg "PLATFORM=${platform}" \
+              --label "org.opencontainers.image.source=${src}" \
+              --label "org.opencontainers.image.revision=${rev}" \
+              --label "org.opencontainers.image.version=${version}" \
+              --label "org.opencontainers.image.title=${svc}" \
+              --label "org.opencontainers.image.licenses=LGPL-3.0" \
+              -t "${img}:${version}" \
+              .
+            docker push "${img}:${version}"
+          done
+
+      - name: 公开 GHCR 包
+        if: steps.published.outputs.skip != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MISSING: ${{ steps.published.outputs.missing }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER}"
+          for item in ${MISSING}; do
+            svc="${item%%:*}"
+            gh api --method PUT \
+              "/users/${owner}/packages/container/${svc}/visibility" \
+              -f visibility=public || true
+          done
+
+      - name: 推送到 CNB 并触发流水线
+        id: cnb
+        env:
+          PAIRS: ${{ steps.ver.outputs.pairs }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CNB_TOKEN}" ]; then
+            echo "缺少 GitHub Secret: CNB_TOKEN" >&2
+            exit 1
+          fi
+
+          api="https://api.cnb.cool"
+          auth_hdr() {
+            curl -sS "$@" \
+              -H "Authorization: Bearer ${CNB_TOKEN}" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json"
+          }
+
+          if [ -z "${CNB_REPO}" ]; then
+            echo "缺少 GitHub Variable: CNB_REPO" >&2
+            exit 1
+          fi
+          echo "cnb_repo=${CNB_REPO}" >> "$GITHUB_OUTPUT"
+
+          group="${CNB_REPO%/*}"
+          name="${CNB_REPO##*/}"
+          code="$(curl -sS -o /tmp/cnb-repo.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${CNB_TOKEN}" \
+            -H "Accept: application/json" \
+            "${api}/${CNB_REPO}")"
+          if [ "$code" = "404" ]; then
+            echo "创建 CNB 仓库 ${CNB_REPO}"
+            auth_hdr -X POST "${api}/${group}/-/repos" \
+              -d "{\"name\":\"${name}\",\"visibility\":\"public\",\"description\":\"Jeepay UI public fork mirror from GitHub\"}"
+          elif [ "$code" != "200" ]; then
+            echo "查询 CNB 仓库失败 HTTP ${code}" >&2
+            cat /tmp/cnb-repo.json >&2 || true
+            exit 1
+          fi
+
+          git push --force "https://cnb:${CNB_TOKEN}@cnb.cool/${CNB_REPO}" "HEAD:refs/heads/main"
+
+          # GHCR 已有同版本也不能跳过 CNB：制品必须由 CNB 按这份代码构建。
+          curl -sS -o /tmp/cnb-build.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${CNB_TOKEN}" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            "${api}/${CNB_REPO}/-/build/start" \
+            -d "{\"event\":\"api_trigger\",\"branch\":\"main\",\"title\":\"release ${PAIRS}\"}" \
+            >/tmp/cnb-build.code
+          echo "CNB 构建触发 HTTP $(cat /tmp/cnb-build.code)"
+          case "$(cat /tmp/cnb-build.code)" in
+            200|201) ;;
+            *)
+              echo "CNB 构建触发失败" >&2
+              cat /tmp/cnb-build.json >&2 || true
+              exit 1
+              ;;
+          esac
+          python3 - <<'PY'
+          import json, os
+          d = json.load(open("/tmp/cnb-build.json"))
+          sn = d.get("sn") or ""
+          print("sn", sn)
+          print("url", d.get("buildLogUrl") or "")
+          if not d.get("success", True):
+              raise SystemExit("CNB 未接受构建触发")
+          if not sn:
+              raise SystemExit("CNB 构建未返回 sn")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"sn={sn}\n")
+          PY
+
+      - name: 等待 CNB 构建完成
+        env:
+          CNB_SN: ${{ steps.cnb.outputs.sn }}
+          CNB_REPO: ${{ steps.cnb.outputs.cnb_repo || vars.CNB_REPO }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, time, urllib.error, urllib.request
+
+          api = "https://api.cnb.cool"
+          repo = os.environ["CNB_REPO"]
+          sn = os.environ["CNB_SN"]
+          token = os.environ["CNB_TOKEN"]
+          deadline = time.time() + 70 * 60
+          done = {"success", "succeeded", "complete", "completed", "finish", "finished", "ok"}
+          fail = {"failed", "fail", "error", "cancel", "cancelled", "canceled", "stopped", "timeout", "timed_out"}
+
+          def load_status():
+              req = urllib.request.Request(f"{api}/{repo}/-/build/status/{sn}")
+              req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("Accept", "application/vnd.cnb.api+json, application/json")
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)
+
+          last = ""
+          while time.time() < deadline:
+              try:
+                  data = load_status()
+              except urllib.error.HTTPError as e:
+                  print("status http", e.code, flush=True)
+                  time.sleep(15)
+                  continue
+              status = (data.get("status") or "").strip()
+              pipes = data.get("pipelinesStatus") or {}
+              pipe_st = [((v or {}).get("status") or "") for v in pipes.values()] if isinstance(pipes, dict) else []
+              line = status + " " + ",".join(pipe_st)
+              if line != last:
+                  print("status", status, "pipelines", pipe_st or "-", flush=True)
+                  last = line
+              s = status.lower()
+              ps = [x.lower() for x in pipe_st]
+              if s in fail or any(x in fail for x in ps):
+                  print("CNB 构建失败", json.dumps(data)[:1500], flush=True)
+                  sys.exit(1)
+              if s in done or (ps and all(x in done for x in ps)):
+                  print("CNB 构建完成", flush=True)
+                  sys.exit(0)
+              time.sleep(30)
+          print("等待 CNB 构建超时", sn, flush=True)
+          sys.exit(1)
+          PY
+
+      - name: 核验 CNB 镜像为 linux/amd64
+        env:
+          PAIRS: ${{ steps.ver.outputs.pairs }}
+          CNB_REPO: ${{ steps.cnb.outputs.cnb_repo || vars.CNB_REPO }}
+        run: |
+          set -euo pipefail
+          python3 - "$CNB_REPO" $PAIRS <<'PY'
+          import base64, json, os, sys, urllib.request
+
+          repo, *items = sys.argv[1:]
+          token = os.environ["CNB_TOKEN"]
+          auth = base64.b64encode(f"cnb:{token}".encode()).decode()
+
+          def get(url, accept):
+              req = urllib.request.Request(url)
+              req.add_header("Authorization", f"Basic {auth}")
+              req.add_header("Accept", accept)
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.load(r)
+
+          def config_arch(name, digest=None, version=""):
+              ref = digest or version
+              man = get(
+                  f"https://docker.cnb.cool/v2/{name}/manifests/{ref}",
+                  "application/vnd.docker.distribution.manifest.v2+json, "
+                  "application/vnd.oci.image.manifest.v1+json, "
+                  "application/vnd.oci.image.index.v1+json, "
+                  "application/vnd.docker.distribution.manifest.list.v2+json",
+              )
+              media = man.get("mediaType") or ""
+              if "index" in media or man.get("manifests"):
+                  amd = [
+                      m for m in man.get("manifests") or []
+                      if (m.get("platform") or {}).get("architecture") == "amd64"
+                      and (m.get("platform") or {}).get("os") == "linux"
+                  ]
+                  if not amd:
+                      raise SystemExit(f"{name}:{ref} 清单没有 linux/amd64")
+                  return config_arch(name, amd[0]["digest"], version)
+              cfg_digest = (man.get("config") or {}).get("digest")
+              if not cfg_digest:
+                  raise SystemExit(f"{name}:{ref} 没有 config digest")
+              cfg = get(
+                  f"https://docker.cnb.cool/v2/{name}/blobs/{cfg_digest}",
+                  "application/json, application/vnd.docker.container.image.v1+json, "
+                  "application/vnd.oci.image.config.v1+json",
+              )
+              return cfg.get("architecture") or ""
+
+          failed = 0
+          for item in items:
+              svc, version = item.split(":", 1)
+              name = f"{repo}/{svc}"
+              req = urllib.request.Request(f"https://docker.cnb.cool/v2/{name}/manifests/{version}")
+              req.add_header("Authorization", f"Basic {auth}")
+              req.add_header(
+                  "Accept",
+                  "application/vnd.docker.distribution.manifest.v2+json, "
+                  "application/vnd.oci.image.manifest.v1+json, "
+                  "application/vnd.oci.image.index.v1+json, "
+                  "application/vnd.docker.distribution.manifest.list.v2+json",
+              )
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  digest = r.headers.get("Docker-Content-Digest") or ""
+              arch = config_arch(name, None, version)
+              print(svc, version, "digest", digest, "arch", arch)
+              if arch != "amd64":
+                  print(svc, "不是 amd64", file=sys.stderr)
+                  failed = 1
+          if failed:
+              raise SystemExit("CNB 镜像 architecture 不是 amd64")
+          PY
