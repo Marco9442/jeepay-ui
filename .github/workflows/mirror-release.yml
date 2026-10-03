@@ -216,18 +216,32 @@ jobs:
           import json, os, sys, urllib.request, urllib.error
           owner, *items = sys.argv[1:]
           missing = []
+
+          def absent(code):
+              return code in (401, 403, 404)
+
           for item in items:
               svc, version = item.split(":", 1)
               tok_url = f"https://ghcr.io/token?service=ghcr.io&scope=repository:{owner}/{svc}:pull"
-              with urllib.request.urlopen(tok_url, timeout=20) as r:
-                  token = json.load(r).get("token") or ""
+              try:
+                  with urllib.request.urlopen(tok_url, timeout=20) as r:
+                      token = json.load(r).get("token") or ""
+              except urllib.error.HTTPError as e:
+                  # 包还不存在时，匿名查询会直接被拒绝。
+                  if absent(e.code):
+                      missing.append(item)
+                      continue
+                  raise
               req = urllib.request.Request(f"https://ghcr.io/v2/{owner}/{svc}/manifests/{version}")
               req.add_header("Authorization", f"Bearer {token}")
-              req.add_header("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json")
+              req.add_header("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json")
               try:
                   urllib.request.urlopen(req, timeout=20)
-              except urllib.error.HTTPError:
-                  missing.append(item)
+              except urllib.error.HTTPError as e:
+                  if absent(e.code):
+                      missing.append(item)
+                      continue
+                  raise
           skip = "false" if missing else "true"
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write("skip=" + skip + "\n")
